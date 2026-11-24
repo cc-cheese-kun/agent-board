@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""AI 共用看板服务：任务看板 + 只追加的流水。只用 Python 标准库。
+"""Shared board server for several AI agents: a task board plus an append-only
+event log. Python standard library only (http.server + sqlite3).
+
+Why: when Claude Code, Gemini CLI, Codex and a human work on the same projects,
+they need one place to see who is doing what. The two rules that matter are
+enforced here, not left to prompts: a task can only be claimed by one actor at a
+time, and only its owner can change its status. The log is append-only, so the
+history of who did what can't be rewritten.
+
+Environment:
+  BOARD_TOKEN  required, at least 24 chars (environment only, never in the repo)
+  BOARD_HOST   listen address, default 127.0.0.1 (in deployment use a private
+               Tailscale IP; 0.0.0.0 is refused unless BOARD_ALLOW_PUBLIC=1)
+  BOARD_PORT   default 8765
+  BOARD_DB     SQLite file, default ./board.db
+
+AI 共用看板服务：任务看板 + 只追加的流水。只用 Python 标准库。
 
 环境变量：
   BOARD_TOKEN  必填，访问口令（只放环境变量，不进仓库）
@@ -21,24 +37,33 @@ TOKEN = os.environ.get("BOARD_TOKEN", "")
 HOST = os.environ.get("BOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BOARD_PORT", "8765"))
 DB = os.environ.get("BOARD_DB", "board.db")
-TZ = timezone(timedelta(hours=8))  # 北京时间
+TZ = timezone(timedelta(hours=8))  # UTC+8 (Beijing time). 北京时间
+# Statuses (stored in Chinese): to do, in progress, stuck, done, dropped.
 STATUSES = ["待做", "进行中", "卡住", "完成", "放弃"]
+# An in-progress task with no new event for this long is flagged "maybe abandoned".
 STALE_HOURS = 2  # 进行中超过这么久没有新流水，列表里标「可能没人管了」
 
+# One lock around every write: check-then-update (e.g. claim) must be atomic, or
+# two agents racing for the same task could both win.
+# 所有写操作共用一把锁：「先查再改」必须是原子的，不然两个 AI 同时认领会都成功。
 LOCK = threading.Lock()
 
 
 def now():
+    """Current time as 'YYYY-MM-DD HH:MM:SS' in TZ.  当前时间。"""
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def connect():
+    """New SQLite connection per request (rows behave like dicts).  每次请求一个连接。"""
     c = sqlite3.connect(DB, timeout=10)
     c.row_factory = sqlite3.Row
     return c
 
 
 def init_db():
+    """Create tables if missing. tasks = current state; events = append-only history.
+    建表：tasks 是当前状态，events 是只追加的流水。"""
     with connect() as c:
         c.executescript(
             """
@@ -68,6 +93,9 @@ def init_db():
 
 
 def add_event(c, actor, task_id, action, detail="", artifact=""):
+    """Append one event and bump the task's last_event_at (used for the stale flag).
+    `artifact` is a path to the output, never the content itself.
+    追加一条流水，顺便更新任务的最后动静时间。"""
     ts = now()
     c.execute(
         "INSERT INTO events(ts,actor,task_id,action,detail,artifact) VALUES(?,?,?,?,?,?)",
@@ -79,6 +107,7 @@ def add_event(c, actor, task_id, action, detail="", artifact=""):
 
 
 def task_row(r):
+    """Task row -> dict, adding `stale` for in-progress tasks idle > STALE_HOURS.  任务转字典，加上 stale 标记。"""
     d = dict(r)
     d["stale"] = False
     if d["status"] == "进行中":
@@ -88,11 +117,14 @@ def task_row(r):
 
 
 class Err(Exception):
+    """An error with an HTTP status code; its message is returned to the client as JSON.
+    带 HTTP 状态码的错误，消息原样返回给客户端。"""
     def __init__(self, code, msg):
         self.code, self.msg = code, msg
 
 
 def need(body, *keys):
+    """400 if any required field is missing or blank.  必填字段缺了就 400。"""
     for k in keys:
         v = body.get(k)
         if v is None or (isinstance(v, str) and not v.strip()):
@@ -100,22 +132,24 @@ def need(body, *keys):
 
 
 def get_task(c, tid):
+    """Fetch a task or raise 404.  取任务，没有就 404。"""
     r = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
     if not r:
         raise Err(404, f"没有 {tid} 号任务")
     return r
 
 
-# ---------- 各个动作 ----------
+# ---------- Actions / 各个动作 ----------
 
 def list_tasks(q):
+    """?status=all | <status> | (default) unfinished only.  列任务，默认只列没结束的。"""
     status = q.get("status", [None])[0]
     with connect() as c:
         if status == "all":
             rows = c.execute("SELECT * FROM tasks ORDER BY id").fetchall()
         elif status:
             rows = c.execute("SELECT * FROM tasks WHERE status=? ORDER BY id", (status,)).fetchall()
-        else:  # 默认只列没结束的
+        else:  # default: unfinished only. 默认只列没结束的
             rows = c.execute(
                 "SELECT * FROM tasks WHERE status IN ('待做','进行中','卡住') ORDER BY id"
             ).fetchall()
@@ -123,6 +157,7 @@ def list_tasks(q):
 
 
 def create_task(body):
+    """New task in 待做 (to do).  新建任务。"""
     need(body, "actor", "title")
     with LOCK, connect() as c:
         ts = now()
@@ -136,6 +171,8 @@ def create_task(body):
 
 
 def claim(tid, body):
+    """Claim a task: 409 if it is finished or already owned by someone else.
+    Re-claiming your own task is allowed (harmless).  认领：已结束或别人认领过就 409。"""
     need(body, "actor")
     actor = body["actor"]
     with LOCK, connect() as c:
@@ -153,6 +190,9 @@ def claim(tid, body):
 
 
 def release(tid, body):
+    """Give a task back to 待做. Only the owner may, unless force=True, which
+    requires a written reason so the takeover is explained in the log.
+    放手：只有认领人能放；强制抢回必须写原因，流水里留痕。"""
     need(body, "actor")
     with LOCK, connect() as c:
         t = get_task(c, tid)
@@ -166,6 +206,8 @@ def release(tid, body):
 
 
 def set_status(tid, body):
+    """Change status; only the current owner may. done/dropped/stuck need a detail
+    line, so the log always says why.  改状态：只有认领人能改；完成、放弃、卡住必须写原因。"""
     need(body, "actor", "status")
     st = body["status"]
     if st not in STATUSES:
@@ -176,7 +218,7 @@ def set_status(tid, body):
             who = t["owner"] or "没人"
             raise Err(409, f"{tid} 号现在归{who}，先认领再改状态")
         if st in ("完成", "放弃", "卡住"):
-            need(body, "detail")  # 结束或卡住都要写清楚
+            need(body, "detail")  # finishing or getting stuck must be explained. 结束或卡住都要写清楚
         note = body.get("detail", "")
         c.execute("UPDATE tasks SET status=?, updated_at=?, note=? WHERE id=?",
                   (st, now(), note or t["note"], tid))
@@ -185,6 +227,7 @@ def set_status(tid, body):
 
 
 def log_event(body):
+    """Free-form log entry, optionally tied to a task.  记一条流水，可以不属于任何任务。"""
     need(body, "actor", "detail")
     tid = body.get("task_id")
     with LOCK, connect() as c:
@@ -196,6 +239,7 @@ def log_event(body):
 
 
 def list_events(q):
+    """Latest events (max 500), oldest first; ?task_id= filters one task.  最近的流水。"""
     tid = q.get("task_id", [None])[0]
     limit = min(int(q.get("limit", ["50"])[0]), 500)
     with connect() as c:
@@ -207,6 +251,8 @@ def list_events(q):
 
 
 def export_md():
+    """The whole board as markdown: a readable mirror agents can fall back on when
+    the server is unreachable.  导出 markdown 镜像，服务连不上时可以先看它。"""
     with connect() as c:
         tasks = [task_row(r) for r in c.execute("SELECT * FROM tasks ORDER BY id").fetchall()]
         evs = c.execute("SELECT * FROM events ORDER BY id").fetchall()
@@ -242,11 +288,13 @@ def export_md():
 
 
 # ---------- HTTP ----------
+# Routes: GET /health (no auth), GET|POST /tasks, GET /tasks/<id>,
+# POST /tasks/<id>/claim|release|status, GET|POST /events, GET /export.md
 
 class H(BaseHTTPRequestHandler):
     server_version = "ai-board/1"
 
-    def log_message(self, fmt, *a):  # 不打印请求，免得口令进日志
+    def log_message(self, fmt, *a):  # no request logging, so tokens never reach logs. 不打印请求，免得口令进日志
         pass
 
     def _send(self, code, obj, ctype="application/json; charset=utf-8"):
@@ -258,11 +306,15 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _auth(self):
+        # Constant-time compare, so the token can't be guessed by timing.
+        # 定时比较，防止靠响应时间猜口令。
         got = self.headers.get("Authorization", "")
         return bool(TOKEN) and hmac.compare_digest(got, f"Bearer {TOKEN}")
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
+        # 64 KB cap: agents should log artifact paths, not paste whole files.
+        # 上限 64KB：产物写路径，不贴全文。
         if n > 64 * 1024:
             raise Err(413, "内容太长（上限 64KB），产物请写路径，不要贴全文")
         if not n:
@@ -313,6 +365,8 @@ class H(BaseHTTPRequestHandler):
 
 
 def main():
+    # Refuse to start insecurely: short/missing token, or listening on every interface.
+    # 不安全就不启动：口令太短，或监听所有网卡。
     if len(TOKEN) < 24:
         sys.exit("BOARD_TOKEN 没设或太短（至少 24 位），拒绝启动")
     if HOST == "0.0.0.0" and os.environ.get("BOARD_ALLOW_PUBLIC") != "1":

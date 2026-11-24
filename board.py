@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""看板命令行。所有 AI 都用它读写看板，只依赖 Python 标准库。
+"""Command-line client for the board. Every AI agent (and human) reads and writes
+the shared task board through this one script. Python standard library only.
+
+Needs three environment variables (or ~/.config/ai-board.env, one KEY=VALUE per
+line, chmod 600, never committed anywhere):
+  BOARD_URL    e.g. http://100.x.x.x:8765 (a private Tailscale address)
+  BOARD_TOKEN  access token
+  BOARD_ACTOR  who I am, e.g. Claude Code / Gemini CLI / Codex / a person's name
+Commands: list, show, add, claim (fails if someone else holds it), log, note,
+done, stuck, drop, release [--force with a reason], recent, export (markdown
+mirror). Full usage in Chinese below.
+
+看板命令行。所有 AI 都用它读写看板，只依赖 Python 标准库。
 
 需要三个环境变量（或写在 ~/.config/ai-board.env，每行 KEY=VALUE，权限 600，不进任何仓库）：
   BOARD_URL    例如 http://100.x.x.x:8765
@@ -28,6 +40,8 @@ import urllib.request
 
 
 def load_env():
+    """Load ~/.config/ai-board.env without overriding variables already set; exit if any are missing.
+    读配置文件（不覆盖已有的环境变量），缺了就退出。"""
     path = os.path.expanduser("~/.config/ai-board.env")
     if os.path.exists(path):
         for line in open(path, encoding="utf-8"):
@@ -41,6 +55,9 @@ def load_env():
 
 
 def call(method, path, body=None, raw=False):
+    """One HTTP request to the board server with the bearer token. Returns parsed JSON
+    (or text if raw). Errors exit with the server's message instead of a traceback.
+    调一次看板服务；出错时打印服务端给的原因再退出。"""
     url = os.environ["BOARD_URL"].rstrip("/") + path
     data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -58,10 +75,15 @@ def call(method, path, body=None, raw=False):
             msg = ""
         sys.exit(f"失败（{e.code}）：{msg}")
     except urllib.error.URLError as e:
+        # Server unreachable: tell the agent to keep working from the last exported
+        # mirror and back-fill the log later, rather than stopping.
+        # 连不上就让 AI 先看导出的镜像继续干活，连上后补记，不要停工。
         sys.exit(f"连不上看板服务：{e.reason}。先读最近一次导出的看板镜像，别停工，连上后补记流水。")
 
 
 def show_task(t):
+    """One task as a line: #id [status] title | owner | stale flag (>2 h without activity).
+    一行显示一个任务。"""
     who = f"｜{t['owner']}" if t["owner"] else ""
     flag = "｜⚠超过2小时没动静" if t.get("stale") else ""
     print(f"#{t['id']} [{t['status']}] {t['title']}{who}{flag}")
@@ -70,6 +92,7 @@ def show_task(t):
 
 
 def show_events(evs):
+    """Event log lines: time | actor | #task action | detail (artifact).  打印流水。"""
     for e in evs:
         tid = f"#{e['task_id']} " if e["task_id"] else ""
         art = f"（产物：{e['artifact']}）" if e["artifact"] else ""
@@ -105,6 +128,8 @@ def main(a):
     elif cmd == "note":
         r = call("POST", "/events", {"actor": me, "detail": arg(0, ""), "artifact": arg(1, "")})
         print("已记", r["ts"])
+    # Status names stored in Chinese: 完成 done, 卡住 stuck, 放弃 dropped.
+    # 状态在服务端用中文存。
     elif cmd in ("done", "stuck", "drop"):
         st = {"done": "完成", "stuck": "卡住", "drop": "放弃"}[cmd]
         show_task(call("POST", f"/tasks/{arg(0)}/status",

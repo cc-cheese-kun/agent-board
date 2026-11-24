@@ -1,4 +1,10 @@
-"""端到端测试：起一个本地服务，用 board.py 走一遍建任务、抢认领、记流水、收尾、导出。
+"""End-to-end test: start a local server and drive it through board.py - create a
+task, race two agents for it (only one may win), log events, close it, export.
+Also checks a wrong token is rejected, a short token and 0.0.0.0 are refused.
+
+Usage: python3 tests/test_board.py
+
+端到端测试：起一个本地服务，用 board.py 走一遍建任务、抢认领、记流水、收尾、导出。
 
 python3 tests/test_board.py
 """
